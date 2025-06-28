@@ -4,11 +4,15 @@
 #include <NimBLEUtils.h>
 // #include <NimBLE2902.h>
 #include "audio_classifire.h"
+#include <driver/i2s.h>
 #include <math.h>
 
 #define SAMPLE_FREQ 16000                      
 #define TOTAL_SAMPLES EI_CLASSIFIER_RAW_SAMPLE_COUNT // This should be 16000*3 = 48000
-#define MIC_PIN 34 
+// I2S Configuration for INMP441
+#define I2S_WS 15    // Word Select (LRCL)
+#define I2S_SCK 13   // Bit Clock (BCLK) 
+#define I2S_SD 32 
 
 // BLE UUIDs
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
@@ -98,56 +102,7 @@ void initBLE() {
   displayTextClear("BLE Ready - Advertising", 10, 10, TFT_GREEN);
 }
 
-// Function to generate dummy audio data
-void generateDummyAudioData(int16_t* buffer, int samples, int signalType = 0) {
-  for (int i = 0; i < samples; i++) {
-    if (i%1000 == 0){
-      displayTextClear("Generating sample " + String(i + 1) + "/" + String(samples), 10, 10, TFT_CYAN);
-      // Send progress over BLE
-      sendBLEMessage("Progress: " + String(i + 1) + "/" + String(samples));
-    }
-    switch (signalType) {
-      case 0: // Sine wave at 440Hz (A note)
-        buffer[i] = (int16_t)(sin(2.0 * PI * 440.0 * i / SAMPLE_FREQ) * 16383); // 16383 = 32767 * 0.5
-        break;
-      case 1: // White noise
-        buffer[i] = random(-9830, 9830); // ~30% of int16 range
-        break;
-      case 2: // Chirp signal (frequency sweep)
-        {
-          float t = (float)i / SAMPLE_FREQ;
-          float duration = (float)samples / SAMPLE_FREQ;
-          float freq = 200 + (2000 * t / duration);
-          buffer[i] = (int16_t)(sin(2.0 * PI * freq * t) * 13107); // 13107 = 32767 * 0.4
-        }
-        break;
-      case 3: // Square wave at 100Hz
-        buffer[i] = (sin(2.0 * PI * 100.0 * i / SAMPLE_FREQ) > 0) ? 9830 : -9830;
-        break;
-      case 4: // Impulse train (clicks)
-        buffer[i] = (i % (SAMPLE_FREQ / 10) == 0) ? 26214 : 0; // 10 clicks per second
-        break;
-      default: // Silence
-        buffer[i] = 0;
-        break;
-    }
-  }
-}
 
-// Callback function to provide audio data to the classifier
-static int audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
-    for (size_t i = 0; i < length; i++) {
-        if (offset + i < TOTAL_SAMPLES) {
-            // Convert int16_t to float and normalize to [-1.0, 1.0] range
-            out_ptr[i] = (float)audioBuffer[offset + i] / 32767.0f;
-        } else {
-            out_ptr[i] = 0.0f;
-        }
-    }
-    return 0;
-}
-
-// Enhanced display functions
 void drawProgressBar(int x, int y, int width, int height, int progress, int total, uint16_t fillColor = TFT_GREEN, uint16_t bgColor = TFT_DARKGREY) {
   // Draw border
   tft.drawRect(x, y, width, height, TFT_WHITE);
@@ -286,94 +241,147 @@ void updateDisplay(String mainText, String subText = "", uint16_t mainColor = TF
   drawFooter();
 }
 
-// Enhanced function to generate dummy audio data with progress
-void generateDummyAudioDataWithProgress(int16_t* buffer, int samples, int signalType = 0) {
-  String signalName;
-  switch (signalType) {
-    case 0: signalName = "440Hz Sine"; break;
-    case 1: signalName = "White Noise"; break;
-    case 2: signalName = "Chirp Signal"; break;
-    case 3: signalName = "Square Wave"; break;
-    case 4: signalName = "Impulse Train"; break;
-    default: signalName = "Silence"; break;
+void configureI2S() {
+  const i2s_config_t i2s_config = {
+    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_FREQ,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+
+  esp_err_t result = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  if (result != ESP_OK) {
+    updateDisplay("I2S Error!", "Driver install failed", TFT_RED, TFT_WHITE);
+    return;
   }
+
+  result = i2s_set_pin(I2S_NUM_0, &pin_config);
+  if (result != ESP_OK) {
+    updateDisplay("I2S Error!", "Pin config failed", TFT_RED, TFT_WHITE);
+    return;
+  }
+
+  result = i2s_zero_dma_buffer(I2S_NUM_0);
+  if (result != ESP_OK) {
+    updateDisplay("I2S Error!", "DMA clear failed", TFT_RED, TFT_WHITE);
+    return;
+  }
+
+  updateDisplay("I2S Ready", "Microphone configured", TFT_GREEN, TFT_WHITE);
+  sendBLEMessage("I2S microphone configured successfully");
+}
+
+// Function to generate dummy audio data
+void sampleAudioData(int16_t* buffer, int samples) {
+  updateDisplay("Recording...", "Sampling audio from mic", TFT_YELLOW, TFT_WHITE);
+  sendBLEMessage("Starting audio recording...");
   
   int progressUpdateInterval = samples / 20; // Update 20 times
+  int32_t i2s_buffer[1024]; // Temporary buffer for I2S data
+  size_t bytes_read = 0;
+  int samplesRead = 0;
   
-  for (int i = 0; i < samples; i++) {
-    if (i % progressUpdateInterval == 0) {
-      int progress = (i * 100) / samples;
+  // Start I2S
+  i2s_start(I2S_NUM_0);
+  
+  while (samplesRead < samples) {
+    // Calculate how many samples to read this iteration
+    int samplesToRead = min(1024, samples - samplesRead);
+    
+    // Read from I2S
+    esp_err_t result = i2s_read(I2S_NUM_0, i2s_buffer, samplesToRead * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+    
+    if (result != ESP_OK) {
+      updateDisplay("I2S Error!", "Read failed", TFT_RED, TFT_WHITE);
+      sendBLEMessage("ERROR: I2S read failed");
+      break;
+    }
+    
+    int actualSamples = bytes_read / sizeof(int32_t);
+    
+    // Convert 32-bit I2S data to 16-bit and store in buffer
+    for (int i = 0; i < actualSamples && samplesRead < samples; i++) {
+      // INMP441 data is in the upper 24 bits of the 32-bit word
+      // Shift right by 16 to get 16-bit data
+      buffer[samplesRead] = (int16_t)(i2s_buffer[i] >> 16);
+      Serial.printf("Sample %d: %d\n", samplesRead, buffer[samplesRead]);
+      samplesRead++;
+    }
+    
+    // Update progress display
+    if (samplesRead % progressUpdateInterval == 0 || samplesRead >= samples) {
+      int progress = (samplesRead * 100) / samples;
       
       // Clear progress area
       tft.fillRect(0, 140, 320, 40, TFT_BLACK);
       
       // Draw progress bar
-      drawProgressBar(50, 145, 220, 15, i, samples, TFT_BLUE, TFT_DARKGREY);
+      drawProgressBar(50, 145, 220, 15, samplesRead, samples, TFT_BLUE, TFT_DARKGREY);
       
       // Draw progress text
       tft.setTextSize(1);
       tft.setTextColor(TFT_WHITE);
-      String progressText = "Generating " + signalName + "...";
+      String progressText = "Recording audio...";
       int textWidth = tft.textWidth(progressText);
       tft.drawString(progressText, (320 - textWidth) / 2, 130);
       
-      sendBLEMessage("Generating " + signalName + ": " + String(progress) + "%");
-    }
-    
-    // Generate sample based on signal type (same as before)
-    switch (signalType) {
-      case 0: // Sine wave at 440Hz
-        buffer[i] = (int16_t)(sin(2.0 * PI * 440.0 * i / SAMPLE_FREQ) * 16383);
-        break;
-      case 1: // White noise
-        buffer[i] = random(-9830, 9830);
-        break;
-      case 2: // Chirp signal
-        {
-          float t = (float)i / SAMPLE_FREQ;
-          float duration = (float)samples / SAMPLE_FREQ;
-          float freq = 200 + (2000 * t / duration);
-          buffer[i] = (int16_t)(sin(2.0 * PI * freq * t) * 13107);
-        }
-        break;
-      case 3: // Square wave at 100Hz
-        buffer[i] = (sin(2.0 * PI * 100.0 * i / SAMPLE_FREQ) > 0) ? 9830 : -9830;
-        break;
-      case 4: // Impulse train
-        buffer[i] = (i % (SAMPLE_FREQ / 10) == 0) ? 26214 : 0;
-        break;
-      default: // Silence
-        buffer[i] = 0;
-        break;
+      sendBLEMessage("Recording: " + String(progress) + "% (" + String(samplesRead) + "/" + String(samples) + ")");
     }
   }
+  
+  // Stop I2S
+  i2s_stop(I2S_NUM_0);
+  
+  updateDisplay("Recording Complete", String(samplesRead) + " samples captured", TFT_GREEN, TFT_WHITE);
+  sendBLEMessage("Audio recording completed - " + String(samplesRead) + " samples");
+  delay(1000);
 }
 
-// Enhanced classification function
-void classifyAudioData(int signalType) {
-    String signalName;
-    switch (signalType) {
-      case 0: signalName = "440Hz Sine Wave"; break;
-      case 1: signalName = "White Noise"; break;
-      case 2: signalName = "Chirp Signal"; break;
-      case 3: signalName = "100Hz Square Wave"; break;
-      case 4: signalName = "Impulse Train"; break;
-      default: signalName = "Silence"; break;
+
+// Callback function to provide audio data to the classifier
+static int audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
+    for (size_t i = 0; i < length; i++) {
+        if (offset + i < TOTAL_SAMPLES) {
+            // Convert int16_t to float and normalize to [-1.0, 1.0] range
+            out_ptr[i] = (float)audioBuffer[offset + i] / 32767.0f;
+        } else {
+            out_ptr[i] = 0.0f;
+        }
     }
+    return 0;
+}
+
+// Enhanced display functions
+
+
+// Enhanced function to generate dummy audio data with progress
+// Enhanced classification function
+void classifyRealAudio() {
+    currentTestStep = 0;
     
-    currentTestStep = signalType;
+    updateDisplay("Prepare to Record", "Audio will be captured for 3 seconds", TFT_CYAN, TFT_WHITE);
+    sendBLEMessage("Preparing to record audio - 3 second duration");
+    delay(2000);
     
-    updateDisplay("Test " + String(signalType + 1) + "/" + String(totalTestSteps), 
-                  "Preparing " + signalName, TFT_CYAN, TFT_WHITE);
+    // Sample real audio data
+    sampleAudioData(audioBuffer, TOTAL_SAMPLES);
     
-    sendBLEMessage("Starting test " + String(signalType + 1) + ": " + signalName);
-    delay(1000);
-    
-    // Generate dummy audio data with enhanced progress display
-    generateDummyAudioDataWithProgress(audioBuffer, TOTAL_SAMPLES, signalType);
-    
-    updateDisplay("Classifying...", signalName, TFT_YELLOW, TFT_WHITE);
-    sendBLEMessage("Running classifier for " + signalName);
+    updateDisplay("Classifying...", "Processing recorded audio", TFT_YELLOW, TFT_WHITE);
+    sendBLEMessage("Running classifier on recorded audio");
     
     // Setup signal structure
     signal_t signal;
@@ -414,14 +422,28 @@ void classifyAudioData(int signalType) {
     
     sendBLEMessage("Result: " + bestClass + " (" + String(maxConfidence * 100, 1) + "%)");
     
-    // Show timing info briefly
-    delay(1500);
+    // Show all classification results
+    delay(2000);
+    updateDisplay("All Results:", "", TFT_CYAN, TFT_WHITE);
+    delay(1000);
+    
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        String className = String(result.classification[ix].label);
+        float confidence = result.classification[ix].value * 100;
+        
+        updateDisplay(className, String(confidence, 1) + "%", 
+                     confidence > 50 ? TFT_GREEN : TFT_WHITE, TFT_DARKGREY);
+        sendBLEMessage(className + ": " + String(confidence, 1) + "%");
+        delay(1500);
+    }
+    
+    // Show timing info
     String timingInfo = "DSP: " + String(result.timing.dsp) + "ms, Class: " + String(result.timing.classification) + "ms";
     updateDisplay("Timing Info", timingInfo, TFT_YELLOW, TFT_CYAN);
+    sendBLEMessage("Timing - " + timingInfo);
     
-    delay(2000);
+    delay(3000);
 }
-
 void setup() {
   Serial.begin(115200);
   while(!Serial);
@@ -454,6 +476,11 @@ void setup() {
   sendBLEMessage("Memory allocated successfully");
   delay(1000);
   
+
+   // Configure I2S for INMP441 microphone
+  configureI2S();
+  delay(1000);
+
   // Display model info
   String modelInfo = String(TOTAL_SAMPLES) + " samples, " + String((float)TOTAL_SAMPLES / SAMPLE_FREQ, 1) + "s";
   updateDisplay("Model Ready", modelInfo, TFT_CYAN, TFT_WHITE);
@@ -479,7 +506,7 @@ void loop() {
   
   // Test different signal types
   for (int signalType = 0; signalType < 6; signalType++) {
-    classifyAudioData(signalType);
+    classifyRealAudio();
     delay(1000);
   }
   
